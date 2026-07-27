@@ -935,11 +935,5 @@ if full_data and history_info:
 
 else:
     st.error("서버에서 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.")
-<<<<<<< Updated upstream
 # history_info 변수에 담긴 진짜 에러 메시지를 출력합니다.
     st.warning(f"디버그 에러 로그: {history_info}")
-=======
-# 디버깅을 위해 추가할 코드 (로그 창에 출력하거나 화면에 바로 띄우기)
-    print(f"상세 에러 원인: {e}") 
-    st.write(f"상세 에러 원인: {e}")
->>>>>>> Stashed changes
