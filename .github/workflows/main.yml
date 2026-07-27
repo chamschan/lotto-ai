@@ -1,0 +1,37 @@
+name: Auto Update Lotto Data
+
+on:
+  schedule:
+    # 매주 토요일 밤 10시 (한국시간 기준) 실행
+    # UTC 기준 토요일 13:00으로 설정 (13 + 9 = 한국시간 22시)
+    - cron: '0 13 * * 6'
+  workflow_dispatch: # 수동으로도 버튼을 눌러 실행할 수 있게 해주는 옵션
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest # 가상의 리눅스 서버 가동
+
+    steps:
+      - name: 저장소 코드 가져오기
+        uses: actions/checkout@v3
+
+      - name: 파이썬 환경 설정
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13' # 회원님 환경과 동일하게 맞춤
+
+      - name: 필요한 패키지 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: 데이터 수집 스크립트 실행
+        run: python update_lotto.py
+
+      - name: 변경된 데이터 깃허브에 커밋 및 푸시
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add lotto_data.json
+          # 변경사항이 있을 때만 커밋하고 푸시 (에러 방지)
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update lotto data: $(date +'%Y-%m-%d %H:%M:%S')" && git push)
