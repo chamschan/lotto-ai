@@ -332,25 +332,14 @@ def generate_ai_games(
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_lotto_data_cached():
-    url = "https://www.dhlottery.co.kr/lt645/selectPstLt645Info.do?srchLtEpsd=all"
-    
-    # 일반 크롬 브라우저처럼 보이도록 헤더를 정교하게 위장
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://www.dhlottery.co.kr/",
-        "Connection": "keep-alive"
-    }
-    
-    # 타임아웃을 30초로 늘리고, SSL 검증을 우회합니다.
-    # verify=False 사용 시 발생하는 InsecureRequestWarning은 무시하셔도 됩니다.
-    res = requests.get(url, headers=headers, timeout=30, verify=False)
+    # 이제 동행복권 대신 내 GitHub에서 직접 읽어옵니다.
+    url = "https://raw.githubusercontent.com/sckimhub/lotto-ai/main/lotto_data.json"
+    res = requests.get(url, timeout=10)
     res.raise_for_status()
     
-    data = res.json().get("data", {}).get("list", [])
+    data = res.json()
     if not data:
-        raise ValueError("API 응답에 데이터가 없습니다.")
+        raise ValueError("GitHub API 응답에 데이터가 없습니다.")
     return data
 
 def fetch_lotto_data(count: int):
