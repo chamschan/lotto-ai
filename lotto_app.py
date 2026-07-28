@@ -219,6 +219,38 @@ class LottoAI:
             return False
         return True
 
+    def get_popularity_bias_weights(self, strength: float = 0.35) -> list:
+        """
+        [주의] 당첨 '확률'과는 무관합니다. 확률은 어떤 조합이든 동일합니다.
+        로또645는 1등 상금을 당첨자 수만큼 나눠 갖는 방식(parimutuel)이라,
+        생일수(1~31)에 사람들이 몰려 선택하는 경향(실증적으로 확인된 사실)을
+        피하면 '당첨됐을 때 나눠 가질 사람 수'가 줄어 기대 배당금이 커집니다.
+        32~45번에 소폭의 가중치를 더해 그 쏠림을 피하도록 유도합니다.
+        """
+        weights = []
+        for n in range(1, 46):
+            if n <= 31:
+                weights.append(1.0)
+            else:
+                weights.append(1.0 + strength)
+        return weights
+
+    def passes_popularity_filter(self, numbers: list) -> bool:
+        """
+        확률이 아니라 '당첨금 분산 방지'용 필터.
+        - 6개 전부 1~31(생일수)에 몰린 조합: 수동 선택자들이 압도적으로 선호하는
+          패턴이라 당첨 시 나눠 가질 사람이 많아질 가능성이 높음 → 배제.
+        - 완전 등차수열(예: 3,9,15,21,27,33): 사람이 '규칙적이라 좋아 보여서'
+          고르는 대표적 패턴 → 배제.
+        """
+        if all(n <= 31 for n in numbers):
+            return False
+        s = sorted(numbers)
+        diffs = {s[i + 1] - s[i] for i in range(len(s) - 1)}
+        if len(diffs) == 1:
+            return False
+        return True
+
     def get_specs(self, numbers: list) -> str:
         """번호 조합의 주요 스펙 요약 문자열 반환."""
         total     = sum(numbers)
@@ -252,6 +284,11 @@ def generate_ai_games(
         ]
     else:
         base_weights = [1.0] * 45
+
+    # 확률 자체와는 무관. 당첨금 분산(공동 당첨자 수) 축소 목적의 가중치.
+    if options.get("use_popularity"):
+        pop_weights = ai.get_popularity_bias_weights()
+        base_weights = [bw * pw for bw, pw in zip(base_weights, pop_weights)]
 
     # 제외 번호 가중치 0 처리
     final_weights = [
@@ -289,6 +326,7 @@ def generate_ai_games(
             if attempts ==  9_000: active_options["use_ac"]              = False; relaxed_any = True
             if attempts == 10_000: active_options["use_stats"]           = False; relaxed_any = True
             if attempts == 11_000: active_options["use_end_digit"]       = False; relaxed_any = True
+            if attempts == 11_500: active_options["use_popularity"]      = False; relaxed_any = True
 
             if attempts > 12_000:
                 picks = random.sample(pool, min(needed, len(pool)))
@@ -313,6 +351,7 @@ def generate_ai_games(
             if active_options.get("use_ac")              and not ai.passes_ac_filter(candidate):         continue
             if active_options.get("use_section_balance") and not ai.passes_section_balance(candidate):   continue
             if active_options.get("use_multiple")        and not ai.passes_multiple_filter(candidate):   continue
+            if active_options.get("use_popularity")      and not ai.passes_popularity_filter(candidate): continue
             if active_options.get("use_consecutive"):
                 if len(final_games) < 3 and not ai.has_consecutive(candidate):
                     if random.random() < 0.7:
@@ -521,6 +560,11 @@ with st.sidebar:
     sb_use_ac      = st.checkbox("📐 AC값 필터",         value=True, key="sb_ac")
     sb_use_section = st.checkbox("⚖️ 구간 합 균형",      value=True, key="sb_section")
     sb_use_multi   = st.checkbox("✖️ 배수 편중 차단",    value=True, key="sb_multi")
+    sb_use_pop     = st.checkbox(
+        "💰 당첨금 분산 방지 (생일수 쏠림 회피)", value=True, key="sb_pop",
+        help="확률을 높이는 기능이 아닙니다. 1등 당첨 시 상금을 나눠 갖는 인원을 줄이기 위해, "
+             "사람들이 몰려 선택하는 1~31 생일수 위주 조합·등차수열 패턴을 피합니다."
+    )
 
     st.markdown("---")
     st.subheader("🎯 번호 고정 / 제외")
@@ -583,6 +627,7 @@ if full_data and history_info:
                 mb_use_ac      = st.checkbox("📐 AC값 필터",       value=sb_use_ac,      key="mb_ac")
                 mb_use_section = st.checkbox("⚖️ 구간 합 균형",    value=sb_use_section, key="mb_section")
                 mb_use_multi   = st.checkbox("✖️ 배수 편중 차단",  value=sb_use_multi,   key="mb_multi")
+                mb_use_pop     = st.checkbox("💰 당첨금 분산 방지", value=sb_use_pop,     key="mb_pop")
 
             st.markdown("**🎯 번호 고정 / 제외**")
             mb_fixed    = st.multiselect("고정 번호", list(range(1, 46)), key="mb_fixed")
@@ -618,6 +663,7 @@ if full_data and history_info:
             "use_ac":              mb_use_ac,
             "use_section_balance": mb_use_section,
             "use_multiple":        mb_use_multi,
+            "use_popularity":      mb_use_pop,
         }
 
         # 고정/제외 충돌 검사
@@ -883,37 +929,51 @@ if full_data and history_info:
     # 탭 4: 설명서
     # ==========================================
     with tab_help:
-        st.subheader("💡 인공지능 분석 원리")
+        st.subheader("💡 원리와 솔직한 한계")
         st.write(
-            "이 프로그램은 단순한 무작위 픽이 아닙니다. "
-            "역대 당첨 번호의 통계적 사실을 바탕으로 당첨 확률이 극히 희박한 조합을 걸러내어 "
-            "효율적인 번호를 추천합니다."
+            "먼저 분명히 말씀드립니다 — **6개 번호 조합은 어떤 것이든 당첨 확률이 정확히 동일합니다.** "
+            "로또 추첨은 매회 독립적인 사건이라 과거 데이터로 다음 회차의 '더 잘 맞을 조합'을 골라낼 방법은 "
+            "수학적으로 존재하지 않습니다. 아래 필터들 대부분은 무작위 조합도 대체로 자연히 만족하는 "
+            "범위(합계, 홀짝, 소수 개수 등)를 확인해 극단적으로 튀는 조합만 걸러내는 것으로, "
+            "**당첨 확률을 높이는 기능이 아니라 '이상해 보이는 조합을 피하는' 정도의 의미**입니다.\n\n"
+            "다만 한 가지는 실질적인 효과가 있습니다. 로또645 1등 상금은 당첨자 수만큼 나눠 갖는 방식이라, "
+            "사람들이 유독 몰려서 고르는 패턴(생일수 1~31, 등차수열 등)을 피하면 — 맞힐 확률 자체는 그대로여도 — "
+            "**맞혔을 때 나눠 가질 사람이 줄어 기대 배당금은 올라갑니다.** '💰 당첨금 분산 방지' 필터가 그 목적입니다."
         )
         st.markdown("---")
 
         filters = [
+            ("💰 당첨금 분산 방지 (Popularity Avoidance)", "success",
+             "**유일하게 기대값에 실질적 영향을 주는 필터입니다.** 당첨 확률이 아니라, 당첨 시 상금을 나눠 갖는 "
+             "인원을 줄이는 목적입니다. 6개 전부 1~31(생일수) 조합이나 완전 등차수열처럼 사람들이 몰려서 "
+             "고르는 패턴을 피합니다."),
             ("🔥 흐름 가중치 (Trend Weight)",          "info",
-             "최근 15주 자주 나온 'Hot Number'가 당분간 계속 나오는 경향성을 반영하여 해당 번호의 뽑힐 확률을 높입니다."),
-            ("❄️ 미출수 부활 (Cold Number)",            "success",
-             "최근 15주간 단 한 번도 나오지 않은 '장기 미출수'를 강제로 1개 이상 포함시켜 회귀의 법칙을 적용합니다."),
-            ("📝 OMR 편중 차단 (OMR Pattern)",          "error",
-             "실제 로또 OMR 용지(5열 9행) 기준, 같은 가로줄이나 세로줄에 번호가 4개 이상 몰리는 비정상적인 패턴을 차단합니다."),
-            ("⚡ 끝자리 일치 (End Digit Sync)",         "success",
-             "역대 당첨 번호의 약 **85% 이상**은 끝자리가 같은 숫자가 최소 1쌍 이상 포함되어 있습니다."),
-            ("☠️ 제외 구간 (Dead Zone)",                "error",
-             "특정 번호대가 통째로 전멸하는 현상이 자주 발생합니다. 자연스러운 전멸 구간을 인위적으로 만듭니다."),
+             "최근 15주 자주 나온 번호에 약간의 가중치를 둡니다. 참고: 로또는 독립 시행이라 과거 출현 빈도가 "
+             "다음 회차 확률에 영향을 준다는 근거는 없습니다. 재미 요소로 생각해 주세요."),
+            ("❄️ 미출수 부활 (Cold Number)",            "info",
+             "최근 15주간 나오지 않은 번호를 1개 이상 포함시킵니다. '회귀의 법칙'은 통계적으로 검증된 개념이 "
+             "아니며, 이 역시 확률을 바꾸지는 않습니다."),
+            ("📝 OMR 편중 차단 (OMR Pattern)",          "warning",
+             "실제 로또 OMR 용지(5열 9행) 기준, 같은 가로줄이나 세로줄에 번호가 4개 이상 몰리는 조합을 "
+             "제외합니다. 무작위 조합 대부분이 자연히 만족하는 범위라 확률에는 영향이 없습니다."),
+            ("⚡ 끝자리 일치 (End Digit Sync)",         "warning",
+             "역대 당첨 번호 중 끝자리가 같은 숫자가 1쌍 이상 포함된 비율이 높다는 통계적 사실을 반영한 "
+             "필터입니다. 무작위 조합도 대부분 이 조건을 만족하므로 실질적 배제 효과는 크지 않습니다."),
+            ("☠️ 제외 구간 (Dead Zone)",                "warning",
+             "9개 구간 중 2개 이상이 비어 있는 분산 패턴을 강제합니다. 확률에는 영향이 없는 취향성 필터입니다."),
             ("📊 통계 정밀 거르기 (Statistical Filter)", "warning",
-             "6개 번호의 합이 100~175 범위를 벗어나거나 홀수/짝수가 6개 몰리는 불량 조합을 원천 차단합니다."),
+             "6개 번호의 합이 100~175 범위를 벗어나거나 홀수/짝수가 6개 몰리는 극단적 조합을 제외합니다."),
             ("🔗 이어지는 번호 (Consecutive Rule)",     "info",
-             "실제로는 50% 이상의 회차에서 연속 번호가 등장합니다. 이 패턴을 일부러 포함시켜 당첨 효율을 높입니다."),
-            ("🔢 소수 필터 (Prime Filter)",             "success",
-             "1~45 중 소수는 14개입니다. 소수가 0개 또는 5개 이상 포함된 조합은 전체의 10% 미만으로 걸러냅니다."),
-            ("📐 AC값 필터 (Arithmetic Complexity)",    "info",
-             "6개 번호 간 차이값의 종류 수(AC값)가 7 미만인 조합은 번호들이 너무 규칙적으로 분포된 경우로 확률이 낮습니다."),
-            ("⚖️ 구간 합 균형 (Section Balance)",       "success",
-             "전반부(1~22) 합과 후반부(23~45) 합의 차이가 50 이상인 극단적 편중 조합을 걸러냅니다."),
+             "실제 당첨 번호 중 연속 번호가 포함된 비율이 절반 이상이라는 통계에 맞춰 이 패턴을 일부 포함시킵니다. "
+             "확률을 높이는 것이 아니라 과거 분포와 비슷한 모양을 만드는 것입니다."),
+            ("🔢 소수 필터 (Prime Filter)",             "warning",
+             "소수가 0개 또는 5개 이상인 극단적 조합만 제외합니다."),
+            ("📐 AC값 필터 (Arithmetic Complexity)",    "warning",
+             "번호 간 차이값의 종류 수가 너무 적어 지나치게 규칙적인 조합을 제외합니다."),
+            ("⚖️ 구간 합 균형 (Section Balance)",       "warning",
+             "전반부(1~22)와 후반부(23~45) 합 차이가 50 이상인 극단적 편중 조합을 제외합니다."),
             ("✖️ 배수 편중 차단 (Multiple Filter)",     "warning",
-             "3의 배수가 4개 이상, 또는 5의 배수가 3개 이상 몰리는 조합은 극히 드뭅니다. 이런 편중 조합을 차단합니다."),
+             "3의 배수 4개 이상, 5의 배수 3개 이상 몰린 조합을 제외합니다."),
             ("🎯 번호 고정 / 제외",                     "info",
              "특정 번호를 반드시 포함하거나 완전히 제외하여 나만의 조합 전략을 세울 수 있습니다. 고정 번호는 최대 5개까지 설정 가능합니다."),
         ]
@@ -925,11 +985,11 @@ if full_data and history_info:
         st.markdown("---")
         st.error(
             "### ⚠️ 꼭 읽어주세요 (면책 조항)\n"
-            "이 프로그램은 불필요한 조합을 제외하고 수학적 확률을 높이기 위해 설계되었지만, "
-            "**로또 번호 추첨은 독립 시행이며 궁극적으로 '운(Luck)'에 의해 결정됩니다.**\n\n"
-            "아무리 뛰어난 인공지능이나 통계 기법을 사용하더라도 100% 당첨을 보장하는 방법은 "
-            "이 세상에 존재하지 않습니다. 본 프로그램을 통해 생성된 번호로 발생한 결과에 대한 "
-            "책임은 전적으로 사용자 본인에게 있습니다. "
+            "**이 프로그램의 어떤 필터도 당첨 확률을 높이지 않습니다.** 6/45 조합은 모두 확률이 동일하며, "
+            "로또 추첨은 완전히 독립적인 시행이라 과거 데이터로 다음 회차를 예측할 수 없습니다. "
+            "'💰 당첨금 분산 방지' 필터만 예외적으로, 당첨 시 나눠 가질 인원을 줄여 기대 배당금을 "
+            "높이는 방향으로 작동하지만 — 이것도 당첨 자체를 보장하거나 확률을 바꾸지는 못합니다.\n\n"
+            "본 프로그램을 통해 생성된 번호로 발생한 결과에 대한 책임은 전적으로 사용자 본인에게 있습니다. "
             "**로또는 반드시 부담 없는 소액으로, 건전하고 즐거운 마음으로만 즐겨 주시기 바랍니다.**"
         )
 
