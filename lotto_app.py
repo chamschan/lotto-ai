@@ -48,72 +48,167 @@ components.html(f"""
 
 
 # ==========================================
-# [1] 구글 스프레드시트 연동
+# [1] 구글 스프레드시트 연동 (서버 저장/로드)
 # ==========================================
+@st.cache_resource(show_spinner=False)
 def get_gsheet_client():
-    if "gcp_service_account" not in st.secrets or "sheet" not in st.secrets:
-        return None
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=scopes
-    )
-    return gspread.authorize(creds)
-
-
-def load_history():
-    records = []
+    """구글 서비스 계정 인증 클라이언트를 캐싱하여 반환합니다."""
     try:
-        gc = get_gsheet_client()
-        if gc:
-            sheet_url = st.secrets["sheet"]["url"]
-            worksheet = gc.open_by_url(sheet_url).sheet1
-            for row in worksheet.get_all_values():
-                if len(row) >= 2:
-                    try:
-                        records.append({
-                            "epsd": int(row[0]),
-                            "games": json.loads(row[1]),
-                        })
-                    except (ValueError, json.JSONDecodeError):
-                        continue
-            return records
+        if "gcp_service_account" not in st.secrets or "sheet" not in st.secrets:
+            return None
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        sa_info = dict(st.secrets["gcp_service_account"])
+        if "private_key" in sa_info and isinstance(sa_info["private_key"], str):
+            sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        return gspread.authorize(creds)
+    except Exception as e:
+        st.session_state["gsheet_init_error"] = str(e)
+        return None
+
+
+def _parse_games_cell(raw_val):
+    """시트 셀에 저장된 JSON 문자열을 안전하게 게임 리스트([[int, ...], ...])로 파싱합니다."""
+    if isinstance(raw_val, list):
+        data = raw_val
+    elif isinstance(raw_val, str):
+        raw_val = raw_val.strip()
+        if not raw_val:
+            return []
+        data = json.loads(raw_val)
+    else:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    # 단일 게임([1, 2, 3, 4, 5, 6]) 형태로 저장된 경우 리스트로 감싸기
+    if data and all(isinstance(x, (int, float)) for x in data):
+        return [[int(x) for x in data]]
+
+    valid_games = []
+    for g in data:
+        if isinstance(g, list) and len(g) > 0:
+            try:
+                valid_games.append(sorted(int(x) for x in g))
+            except (ValueError, TypeError):
+                continue
+    return valid_games
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _load_sheet_records_cached() -> tuple[list, str | None]:
+    """구글 시트에서 이력을 읽어오되, 30초 캐싱으로 API Quota 초과(429 에러)를 방지합니다."""
+    gc = get_gsheet_client()
+    if not gc:
+        err = st.session_state.get("gsheet_init_error")
+        return [], err
+
+    sheet_url = st.secrets["sheet"].get("url", "").strip()
+    if not sheet_url:
+        return [], "st.secrets['sheet']['url'] 설정이 비어 있습니다."
+
+    worksheet = gc.open_by_url(sheet_url).sheet1
+    rows = worksheet.get_all_values()
+    records = []
+    for row in rows:
+        if len(row) >= 2:
+            try:
+                epsd_str = str(row[0]).strip()
+                if not epsd_str or not epsd_str.lstrip("-").isdigit():
+                    continue
+                epsd = int(epsd_str)
+                games = _parse_games_cell(row[1])
+                if games:
+                    records.append({"epsd": epsd, "games": games})
+            except (ValueError, json.JSONDecodeError):
+                continue
+    return records, None
+
+
+def load_history() -> list:
+    """구글 시트(서버) 및 로컬 백업 파일에서 번호 생성 이력을 불러옵니다."""
+    records = []
+    sheet_loaded = False
+
+    try:
+        sheet_records, err_msg = _load_sheet_records_cached()
+        if err_msg:
+            st.warning(f"구글 시트 연결 설정 확인 필요, 로컬 데이터를 함께 사용합니다. ({err_msg})")
+        elif get_gsheet_client() is not None:
+            records.extend(sheet_records)
+            sheet_loaded = True
     except Exception as e:
         st.warning(f"구글 시트 불러오기 실패, 로컬 파일로 대체합니다. ({e})")
 
-    if os.path.exists("lotto_history.jsonl"):
+    # 시트 미연결 또는 실패 시(혹은 로컬에만 저장된 데이터 보완) 로컬 파일 로드
+    if not sheet_loaded and os.path.exists("lotto_history.jsonl"):
         with open("lotto_history.jsonl", "r", encoding="utf-8") as f:
             for line in f:
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
+                line = line.strip()
+                if not line:
                     continue
+                try:
+                    item = json.loads(line)
+                    epsd = int(item.get("epsd", 0))
+                    games = _parse_games_cell(item.get("games", []))
+                    if epsd > 0 and games:
+                        records.append({"epsd": epsd, "games": games})
+                except (ValueError, json.JSONDecodeError):
+                    continue
+
     return records
 
 
 def save_history(epsd: int, games: list, retries: int = 3, retry_delay: float = 1.5) -> bool:
-    gc = get_gsheet_client()
-    if gc:
-        sheet_url = st.secrets["sheet"]["url"]
-        row_data = [epsd, json.dumps(games)]
+    """생성된 번호를 구글 시트(서버)에 실시간 저장하고 캐시를 즉시 갱신합니다."""
+    last_error = None
+    try:
+        gc = get_gsheet_client()
+    except Exception as e:
+        gc = None
+        last_error = e
+
+    if gc and "sheet" in st.secrets and st.secrets["sheet"].get("url"):
+        sheet_url = st.secrets["sheet"]["url"].strip()
+        row_data = [int(epsd), json.dumps(games, ensure_ascii=False)]
+
         for attempt in range(1, retries + 1):
             try:
                 worksheet = gc.open_by_url(sheet_url).sheet1
-                worksheet.append_row(row_data)
-                last_row = worksheet.get_all_values()[-1]
-                if len(last_row) >= 2 and str(last_row[0]) == str(epsd):
+                res = worksheet.append_row(
+                    row_data,
+                    value_input_option="RAW",
+                    insert_data_option="INSERT_ROWS",
+                )
+                # API 응답 또는 마지막 행으로 정상 반영 확인 (불필요한 전체 재조회 및 중복 삽입 방지)
+                updates = res.get("updates", {}) if isinstance(res, dict) else {}
+                updated_rows = updates.get("updatedRows", 1)
+                if updated_rows >= 1:
+                    _load_sheet_records_cached.clear()
                     return True
-                raise ValueError(f"검증 실패: 저장된 회차({last_row[0]}) != 요청 회차({epsd})")
+                raise ValueError(f"구글 시트 행 추가 응답 확인 실패: {res}")
             except Exception as e:
+                last_error = e
                 if attempt < retries:
                     time.sleep(retry_delay)
                 else:
-                    st.warning(f"구글 시트 저장 {retries}회 모두 실패, 로컬 파일에 저장합니다. (마지막 오류: {e})")
+                    st.warning(
+                        f"구글 시트 저장 {retries}회 모두 실패, 로컬 파일에 백업합니다. (마지막 오류: {e})"
+                    )
+    elif last_error:
+        st.warning(f"구글 시트 인증 오류로 로컬 파일에 저장합니다. ({last_error})")
 
-    with open("lotto_history.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps({"epsd": epsd, "games": games}) + "\n")
+    # 로컬 백업 파일 저장
+    try:
+        with open("lotto_history.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"epsd": int(epsd), "games": games}, ensure_ascii=False) + "\n")
+    except Exception as e:
+        st.error(f"로컬 파일 저장 중 오류가 발생했습니다: {e}")
+
     return False
 
 
@@ -137,7 +232,8 @@ class LottoAI:
         counts = Counter(recent)
         weights = {i: 1.0 for i in range(1, 46)}
         for num, freq in counts.items():
-            weights[num] += freq * 0.5
+            if 1 <= num <= 45:
+                weights[num] += freq * 0.5
         return weights
 
     def get_cold_numbers(self, data: list, scope: int = 15) -> set:
@@ -167,7 +263,7 @@ class LottoAI:
         return any(c >= 2 for c in Counter(end_digits).values())
 
     def has_dead_zone(self, numbers: list) -> bool:
-        """5구간 중 2개 이상이 비어있는지 (분산 패턴)."""
+        """9구간(5번호 단위) 중 2개 이상이 비어있는지 (분산 패턴)."""
         zones = [0] * 9
         for n in numbers:
             zones[(n - 1) // 5] = 1
@@ -271,11 +367,12 @@ def generate_ai_games(
     options: dict,
     fixed_nums: list,
     excluded_nums: list,
+    scope: int = 15,
 ) -> list:
     ai = LottoAI()
 
-    if options["use_trend"]:
-        trend_weights = ai.analyze_recent_trend(full_data, scope=15)
+    if options.get("use_trend"):
+        trend_weights = ai.analyze_recent_trend(full_data, scope=scope)
         extra = weight_percent / 100.0
         base_weights = [
             trend_weights.get(i, 1.0) + extra if trend_weights.get(i, 1.0) > 1.0
@@ -298,8 +395,11 @@ def generate_ai_games(
 
     pool         = [i for i in range(1, 46) if i not in excluded_nums and i not in fixed_nums]
     pool_weights = [final_weights[i - 1] for i in pool]
+    if sum(pool_weights) <= 0 and pool:
+        pool_weights = [1.0] * len(pool)
+
     needed       = 6 - len(fixed_nums)
-    cold_numbers = ai.get_cold_numbers(full_data, scope=15)
+    cold_numbers = (ai.get_cold_numbers(full_data, scope=scope) - set(excluded_nums))
 
     final_games = []
     relaxed_any = False
@@ -307,6 +407,10 @@ def generate_ai_games(
     if needed < 0:
         st.warning("고정 번호가 6개를 초과합니다. 고정 번호를 줄여주세요.")
         return [sorted(fixed_nums[:6])] * 5
+
+    if len(pool) < needed:
+        st.error(f"선택 가능한 번호({len(pool)}개)가 필요한 번호 수({needed}개)보다 적습니다. 제외 번호를 줄여주세요.")
+        return []
 
     while len(final_games) < 5:
         active_options = options.copy()
@@ -329,7 +433,7 @@ def generate_ai_games(
             if attempts == 11_500: active_options["use_popularity"]      = False; relaxed_any = True
 
             if attempts > 12_000:
-                picks = random.sample(pool, min(needed, len(pool)))
+                picks = random.sample(pool, needed)
                 final_games.append(sorted(fixed_nums + picks))
                 relaxed_any = True
                 break
@@ -342,16 +446,16 @@ def generate_ai_games(
                     continue
                 candidate = sorted(fixed_nums + picks)
 
-            if active_options.get("use_omr")             and not ai.passes_omr_filter(candidate):       continue
+            if active_options.get("use_omr")             and not ai.passes_omr_filter(candidate):             continue
             if active_options.get("use_cold")            and not ai.has_cold_number(candidate, cold_numbers): continue
-            if active_options.get("use_end_digit")       and not ai.has_end_digit_pair(candidate):      continue
-            if active_options.get("use_dead_zone")       and not ai.has_dead_zone(candidate):            continue
-            if active_options.get("use_stats")           and not ai.passes_stat_filter(candidate):       continue
-            if active_options.get("use_prime")           and not ai.passes_prime_filter(candidate):      continue
-            if active_options.get("use_ac")              and not ai.passes_ac_filter(candidate):         continue
-            if active_options.get("use_section_balance") and not ai.passes_section_balance(candidate):   continue
-            if active_options.get("use_multiple")        and not ai.passes_multiple_filter(candidate):   continue
-            if active_options.get("use_popularity")      and not ai.passes_popularity_filter(candidate): continue
+            if active_options.get("use_end_digit")       and not ai.has_end_digit_pair(candidate):            continue
+            if active_options.get("use_dead_zone")       and not ai.has_dead_zone(candidate):                 continue
+            if active_options.get("use_stats")           and not ai.passes_stat_filter(candidate):            continue
+            if active_options.get("use_prime")           and not ai.passes_prime_filter(candidate):           continue
+            if active_options.get("use_ac")              and not ai.passes_ac_filter(candidate):              continue
+            if active_options.get("use_section_balance") and not ai.passes_section_balance(candidate):        continue
+            if active_options.get("use_multiple")        and not ai.passes_multiple_filter(candidate):        continue
+            if active_options.get("use_popularity")      and not ai.passes_popularity_filter(candidate):      continue
             if active_options.get("use_consecutive"):
                 if len(final_games) < 3 and not ai.has_consecutive(candidate):
                     if random.random() < 0.7:
@@ -367,62 +471,252 @@ def generate_ai_games(
 
 
 # ==========================================
-# [3] 데이터 가져오기
+# [3] 실시간 당첨 데이터 및 당첨금 가져오기
 # ==========================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_lotto_data_cached():
-    # 이제 동행복권 대신 내 GitHub에서 직접 읽어옵니다.
-    url = "https://raw.githubusercontent.com/sckimhub/lotto-ai/main/lotto_data.json"
-    res = requests.get(url, timeout=10)
-    res.raise_for_status()
-    
-    data = res.json()
-    if not data:
-        raise ValueError("GitHub API 응답에 데이터가 없습니다.")
-    return data
+DHLOTTERY_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://www.dhlottery.co.kr/lt645/result",
+}
+
+
+def _normalize_draw_item(item: dict) -> dict | None:
+    """
+    동행복권 신규 API(selectPstLt645Info.do), 구 API(getLottoNumber),
+    GitHub JSON(sckimhub / smok95) 등 다양한 응답 포맷을 단일 스키마로 정규화합니다.
+    """
+    if not isinstance(item, dict):
+        return None
+
+    # 1) 회차 번호 추출
+    epsd = (
+        item.get("ltEpsd")
+        or item.get("drwNo")
+        or item.get("draw_no")
+        or item.get("epsd")
+    )
+    if not epsd:
+        return None
+    try:
+        epsd = int(epsd)
+    except (ValueError, TypeError):
+        return None
+
+    # 2) 당첨 번호 6개 추출
+    nums = []
+    if "tm1WnNo" in item:
+        nums = [int(item.get(f"tm{i}WnNo", 0)) for i in range(1, 7)]
+    elif "drwtNo1" in item:
+        nums = [int(item.get(f"drwtNo{i}", 0)) for i in range(1, 7)]
+    elif "numbers" in item and isinstance(item["numbers"], list) and len(item["numbers"]) >= 6:
+        nums = [int(x) for x in item["numbers"][:6]]
+
+    if len(nums) != 6 or any(n < 1 or n > 45 for n in nums):
+        return None
+
+    # 3) 보너스 번호 추출 (신규 API: bnsWnNo / 구 API: bnusNo / 미러: bonus_no)
+    bonus_raw = (
+        item.get("bnsWnNo")
+        if item.get("bnsWnNo") is not None
+        else (
+            item.get("bnusNo")
+            if item.get("bnusNo") is not None
+            else item.get("bonus_no", 0)
+        )
+    )
+    try:
+        bonus = int(bonus_raw)
+    except (ValueError, TypeError):
+        bonus = 0
+
+    # 4) 등수별 1게임당 당첨금 추출 (신규 API: rnk1WnAmt~rnk5WnAmt / 구 API: firstWinamnt)
+    def _to_int_or_none(v):
+        try:
+            val = int(v)
+            return val if val > 0 else None
+        except (ValueError, TypeError):
+            return None
+
+    p1 = _to_int_or_none(item.get("rnk1WnAmt") or item.get("firstWinamnt"))
+    p2 = _to_int_or_none(item.get("rnk2WnAmt"))
+    p3 = _to_int_or_none(item.get("rnk3WnAmt"))
+    p4 = _to_int_or_none(item.get("rnk4WnAmt"))
+    p5 = _to_int_or_none(item.get("rnk5WnAmt"))
+
+    if "divisions" in item and isinstance(item["divisions"], list):
+        divs = item["divisions"]
+        if len(divs) >= 1 and isinstance(divs[0], dict) and p1 is None:
+            p1 = _to_int_or_none(divs[0].get("prize"))
+        if len(divs) >= 2 and isinstance(divs[1], dict) and p2 is None:
+            p2 = _to_int_or_none(divs[1].get("prize"))
+        if len(divs) >= 3 and isinstance(divs[2], dict) and p3 is None:
+            p3 = _to_int_or_none(divs[2].get("prize"))
+
+    return {
+        "ltEpsd": epsd,
+        "nums": sorted(nums),
+        "bnsWnNo": bonus,
+        "prizes": {
+            1: p1,
+            2: p2 if p2 is not None else 50_000_000,
+            3: p3 if p3 is not None else 1_500_000,
+            4: p4 if p4 is not None else 50_000,
+            5: p5 if p5 is not None else 5_000,
+        },
+    }
+
+
+def _extract_raw_list(payload) -> list:
+    """API 응답 JSON에서 회차 리스트를 추출합니다."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        # 동행복권 신규 API: {"data": {"list": [...]}}
+        if "data" in payload and isinstance(payload["data"], dict):
+            inner = payload["data"].get("list")
+            if isinstance(inner, list):
+                return inner
+        if "list" in payload and isinstance(payload["list"], list):
+            return payload["list"]
+        if "ltEpsd" in payload or "drwNo" in payload:
+            return [payload]
+    return []
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_lotto_data_cached() -> list[dict]:
+    """
+    실시간 동행복권 통합 API 및 GitHub 데이터 소스를 순차적으로 시도하여
+    정규화된 전체 회차 리스트(최신순)를 반환합니다.
+    """
+    ts = int(time.time() * 1000)
+    sources = [
+        (
+            "동행복권 실시간 API",
+            f"https://www.dhlottery.co.kr/lt645/selectPstLt645Info.do?srchLtEpsd=all&_={ts}",
+            DHLOTTERY_HEADERS,
+        ),
+        (
+            "동행복권 실시간 API (보조)",
+            f"https://dhlottery.co.kr/lt645/selectPstLt645Info.do?srchLtEpsd=all&_={ts}",
+            DHLOTTERY_HEADERS,
+        ),
+        (
+            "GitHub 데이터 저장소 (sckimhub)",
+            "https://raw.githubusercontent.com/sckimhub/lotto-ai/main/lotto_data.json",
+            {"User-Agent": "Mozilla/5.0"},
+        ),
+        (
+            "GitHub 공개 미러 (smok95)",
+            "https://smok95.github.io/lotto/results/all.json",
+            {"User-Agent": "Mozilla/5.0"},
+        ),
+    ]
+
+    errors = []
+    for source_name, url, headers in sources:
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            res.raise_for_status()
+            payload = res.json()
+            raw_list = _extract_raw_list(payload)
+            normalized = []
+            seen_epsd = set()
+            for item in raw_list:
+                norm = _normalize_draw_item(item)
+                if norm and norm["ltEpsd"] not in seen_epsd:
+                    seen_epsd.add(norm["ltEpsd"])
+                    normalized.append(norm)
+
+            if normalized:
+                normalized.sort(key=lambda x: x["ltEpsd"], reverse=True)
+                return normalized
+            errors.append(f"{source_name}: 유효한 회차 데이터가 없습니다.")
+        except Exception as e:
+            errors.append(f"{source_name}: {e}")
+
+    raise RuntimeError(" / ".join(errors))
+
 
 def fetch_lotto_data(count: int):
+    """
+    전체 회차 데이터와 최근 count개 회차 정보를 반환합니다.
+    반환값: (full_data_flat, recent_history_info, all_epsd_result_map, all_epsd_prize_map)
+    실패 시: (None, error_message, {}, {})
+    """
     try:
         all_list = _fetch_lotto_data_cached()
     except Exception as e:
-        return None, str(e)
-
-    all_list = sorted(all_list, key=lambda x: int(x.get("ltEpsd", 0)), reverse=True)
+        return None, str(e), {}, {}
 
     full_data_flat = []
+    all_epsd_result_map = {}
+    all_epsd_prize_map = {}
+
     for item in all_list:
-        nums = [int(item.get(f"tm{i}WnNo", 0)) for i in range(1, 7)]
+        epsd   = item["ltEpsd"]
+        nums   = item["nums"]
+        bonus  = item["bnsWnNo"]
+        prizes = item["prizes"]
+
         full_data_flat.extend(nums)
+        all_epsd_result_map[epsd] = (set(nums), bonus)
+        all_epsd_prize_map[epsd]  = prizes
 
-    history_info = []
-    for item in all_list[:count]:
-        epsd  = int(item.get("ltEpsd", 0))
-        nums  = [int(item.get(f"tm{i}WnNo", 0)) for i in range(1, 7)]
-        bonus = int(item.get("bnusNo", 0))
-        history_info.append((epsd, nums, bonus))
+    history_info = [
+        (item["ltEpsd"], item["nums"], item["bnsWnNo"])
+        for item in all_list[:count]
+    ]
 
-    return full_data_flat, history_info
+    return full_data_flat, history_info, all_epsd_result_map, all_epsd_prize_map
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_prize_cached(epsd: int) -> dict:
-    url = f"https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo={epsd}"
-    res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+    """특정 회차의 당첨금 정보를 동행복권 신규 API(및 구 API 폴백)로 조회합니다."""
+    ts = int(time.time() * 1000)
+    new_url = f"https://www.dhlottery.co.kr/lt645/selectPstLt645Info.do?srchLtEpsd={epsd}&_={ts}"
+    try:
+        res = requests.get(new_url, headers=DHLOTTERY_HEADERS, timeout=6)
+        res.raise_for_status()
+        raw_list = _extract_raw_list(res.json())
+        if raw_list:
+            norm = _normalize_draw_item(raw_list[0])
+            if norm and norm["prizes"].get(1):
+                return norm["prizes"]
+    except Exception:
+        pass
+
+    # 구 API 폴백
+    old_url = f"https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo={epsd}"
+    res = requests.get(old_url, headers=DHLOTTERY_HEADERS, timeout=5)
     res.raise_for_status()
     data = res.json()
     if data.get("returnValue") == "success" and data.get("firstWinamnt", 0) > 0:
-        return data
+        return {
+            1: int(data["firstWinamnt"]),
+            2: 50_000_000,
+            3: 1_500_000,
+            4: 50_000,
+            5: 5_000,
+        }
     raise ValueError("당첨금 정보가 아직 업데이트되지 않았습니다.")
 
 
-def fetch_prize_info(epsd: int) -> dict:
+def fetch_prize_info(epsd: int, prize_map: dict | None = None) -> dict:
     default_prizes = {1: None, 2: 50_000_000, 3: 1_500_000, 4: 50_000, 5: 5_000}
+    if prize_map and epsd in prize_map:
+        cached = prize_map[epsd]
+        if cached.get(1) is not None:
+            return cached
     try:
-        data = _fetch_prize_cached(epsd)
-        default_prizes[1] = data.get("firstWinamnt")
+        return _fetch_prize_cached(epsd)
     except Exception:
-        pass
-    return default_prizes
+        return default_prizes
 
 
 # ==========================================
@@ -452,8 +746,13 @@ def get_ball_html(num: int, size: int = 32, fsize: int = 13) -> str:
     )
 
 def draw_row(label: str, balls: list, is_header: bool = False,
-             specs: str = "", highlight: bool = False):
-    balls_html  = "".join(get_ball_html(n) for n in balls)
+             specs: str = "", highlight: bool = False, bonus: int | None = None):
+    balls_html = "".join(get_ball_html(n) for n in balls)
+    if bonus is not None and bonus > 0:
+        balls_html += (
+            '<span style="margin:0 6px;font-weight:bold;color:#7f8c8d;font-size:14px;">+</span>'
+            + get_ball_html(bonus)
+        )
     label_color = "#2980B9" if is_header else "#333"
     bg_color    = "#fffbe6" if highlight else "white"
     border      = "2px solid #f1c40f" if highlight else "1px solid #ddd"
@@ -468,7 +767,7 @@ def draw_row(label: str, balls: list, is_header: bool = False,
     <div style="font-weight:800;color:{label_color};font-size:14px;min-width:60px;
                 margin-right:10px;white-space:nowrap;flex-shrink:0;text-align:center;
                 padding:5px;border-radius:5px;">{label}</div>
-    <div style="display:flex;flex-wrap:nowrap;gap:2px;">{balls_html}</div>
+    <div style="display:flex;flex-wrap:nowrap;align-items:center;gap:2px;">{balls_html}</div>
   </div>
   {specs_html}
 </div>
@@ -518,17 +817,43 @@ html, body, [class*="css"] { font-family: "Malgun Gothic", sans-serif; }
 [data-testid="stToolbar"] { visibility: hidden !important; display: none !important; }
 header { visibility: hidden !important; }
 footer { visibility: hidden !important; }
-.mobile-only-settings { display: none; }
-@media (max-width: 768px) {
-    .mobile-only-settings { display: block; }
-}
 </style>
 """, unsafe_allow_html=True)
 
 
 # ==========================================
-# [6] 세션 상태 초기화
+# [6] 세션 상태 초기화 및 PC/모바일 양방향 동기화
 # ==========================================
+SETTING_DEFAULTS = {
+    "count":   10,
+    "weight":  100,
+    "trend":   True,
+    "cold":    True,
+    "omr":     True,
+    "end":     True,
+    "dead":    True,
+    "stats":   True,
+    "consec":  True,
+    "prime":   True,
+    "ac":      True,
+    "section": True,
+    "multi":   True,
+    "pop":     True,
+    "fixed":    [],
+    "excluded": [],
+}
+
+for name, default_val in SETTING_DEFAULTS.items():
+    cfg_key = f"cfg_{name}"
+    sb_key  = f"sb_{name}"
+    mb_key  = f"mb_{name}"
+    if cfg_key not in st.session_state:
+        st.session_state[cfg_key] = list(default_val) if isinstance(default_val, list) else default_val
+    if sb_key not in st.session_state:
+        st.session_state[sb_key] = list(st.session_state[cfg_key]) if isinstance(default_val, list) else st.session_state[cfg_key]
+    if mb_key not in st.session_state:
+        st.session_state[mb_key] = list(st.session_state[cfg_key]) if isinstance(default_val, list) else st.session_state[cfg_key]
+
 for key, default in {
     "is_generating": False,
     "recent_generated_games": [],
@@ -538,38 +863,78 @@ for key, default in {
         st.session_state[key] = default
 
 
+def sync_setting(name: str, source_prefix: str):
+    """PC 사이드바(sb_*)와 모바일 설정창(mb_*)의 값을 실시간으로 양방향 동기화합니다."""
+    src_key = f"{source_prefix}_{name}"
+    dst_prefix = "mb" if source_prefix == "sb" else "sb"
+    dst_key = f"{dst_prefix}_{name}"
+    cfg_key = f"cfg_{name}"
+
+    val = st.session_state[src_key]
+    st.session_state[cfg_key] = list(val) if isinstance(val, list) else val
+    st.session_state[dst_key] = list(val) if isinstance(val, list) else val
+
+
+def refresh_all_data():
+    """당첨 데이터 및 구글 시트 이력 캐시를 초기화하여 서버와 즉시 재동기화합니다."""
+    _fetch_lotto_data_cached.clear()
+    _fetch_prize_cached.clear()
+    _load_sheet_records_cached.clear()
+
+
 # ==========================================
 # [7] 사이드바 (PC)
 # ==========================================
 with st.sidebar:
     st.header("⚙️ 분석 설정")
-    sb_count_val  = st.number_input("과거 분석 정보(회)", min_value=5, max_value=100, value=10, step=1, key="sb_count")
+    st.button(
+        "🔄 실시간 데이터 새로고침",
+        use_container_width=True,
+        on_click=refresh_all_data,
+        help="동행복권 최신 당첨 결과와 구글 시트 서버 저장 이력을 다시 불러옵니다.",
+    )
+    st.number_input(
+        "과거 분석 정보(회)", min_value=5, max_value=100, step=1,
+        key="sb_count", on_change=sync_setting, args=("count", "sb")
+    )
     st.write("흐름 가중치(%) — 높을수록 최근 번호 우선")
-    sb_weight_val = st.number_input("가중치 입력", min_value=0, value=100, step=10, key="sb_weight")
+    st.number_input(
+        "가중치 입력", min_value=0, step=10,
+        key="sb_weight", on_change=sync_setting, args=("weight", "sb")
+    )
 
     st.markdown("---")
     st.subheader("거르기 조건")
-    sb_use_trend   = st.checkbox("🔥 흐름 가중치",       value=True, key="sb_trend")
-    sb_use_cold    = st.checkbox("❄️ 미출수 부활",       value=True, key="sb_cold")
-    sb_use_omr     = st.checkbox("📝 OMR 편중 차단",     value=True, key="sb_omr")
-    sb_use_end     = st.checkbox("⚡ 끝자리 일치",       value=True, key="sb_end")
-    sb_use_dead    = st.checkbox("☠️ 제외 구간",         value=True, key="sb_dead")
-    sb_use_stats   = st.checkbox("📊 통계 정밀 거르기",  value=True, key="sb_stats")
-    sb_use_consec  = st.checkbox("🔗 이어지는 번호",     value=True, key="sb_consec")
-    sb_use_prime   = st.checkbox("🔢 소수 필터",         value=True, key="sb_prime")
-    sb_use_ac      = st.checkbox("📐 AC값 필터",         value=True, key="sb_ac")
-    sb_use_section = st.checkbox("⚖️ 구간 합 균형",      value=True, key="sb_section")
-    sb_use_multi   = st.checkbox("✖️ 배수 편중 차단",    value=True, key="sb_multi")
-    sb_use_pop     = st.checkbox(
-        "💰 당첨금 분산 방지 (생일수 쏠림 회피)", value=True, key="sb_pop",
+    st.checkbox("🔥 흐름 가중치",      key="sb_trend",   on_change=sync_setting, args=("trend", "sb"))
+    st.checkbox("❄️ 미출수 부활",      key="sb_cold",    on_change=sync_setting, args=("cold", "sb"))
+    st.checkbox("📝 OMR 편중 차단",    key="sb_omr",     on_change=sync_setting, args=("omr", "sb"))
+    st.checkbox("⚡ 끝자리 일치",      key="sb_end",     on_change=sync_setting, args=("end", "sb"))
+    st.checkbox("☠️ 제외 구간",        key="sb_dead",    on_change=sync_setting, args=("dead", "sb"))
+    st.checkbox("📊 통계 정밀 거르기", key="sb_stats",   on_change=sync_setting, args=("stats", "sb"))
+    st.checkbox("🔗 이어지는 번호",    key="sb_consec",  on_change=sync_setting, args=("consec", "sb"))
+    st.checkbox("🔢 소수 필터",        key="sb_prime",   on_change=sync_setting, args=("prime", "sb"))
+    st.checkbox("📐 AC값 필터",        key="sb_ac",      on_change=sync_setting, args=("ac", "sb"))
+    st.checkbox("⚖️ 구간 합 균형",     key="sb_section", on_change=sync_setting, args=("section", "sb"))
+    st.checkbox("✖️ 배수 편중 차단",   key="sb_multi",   on_change=sync_setting, args=("multi", "sb"))
+    st.checkbox(
+        "💰 당첨금 분산 방지 (생일수 쏠림 회피)",
+        key="sb_pop",
+        on_change=sync_setting,
+        args=("pop", "sb"),
         help="확률을 높이는 기능이 아닙니다. 1등 당첨 시 상금을 나눠 갖는 인원을 줄이기 위해, "
              "사람들이 몰려 선택하는 1~31 생일수 위주 조합·등차수열 패턴을 피합니다."
     )
 
     st.markdown("---")
     st.subheader("🎯 번호 고정 / 제외")
-    sb_fixed    = st.multiselect("고정 번호 (반드시 포함)", list(range(1, 46)), key="sb_fixed")
-    sb_excluded = st.multiselect("제외 번호 (절대 미포함)", list(range(1, 46)), key="sb_excluded")
+    st.multiselect(
+        "고정 번호 (반드시 포함)", list(range(1, 46)),
+        key="sb_fixed", on_change=sync_setting, args=("fixed", "sb")
+    )
+    st.multiselect(
+        "제외 번호 (절대 미포함)", list(range(1, 46)),
+        key="sb_excluded", on_change=sync_setting, args=("excluded", "sb")
+    )
 
     st.markdown("---")
     st.subheader("🔥 최근 핫넘버 TOP 5")
@@ -579,7 +944,8 @@ with st.sidebar:
 # ==========================================
 # [8] 데이터 로드
 # ==========================================
-full_data, history_info = fetch_lotto_data(sb_count_val)
+active_count = int(st.session_state["cfg_count"])
+full_data, history_info, epsd_result_map, epsd_prize_map = fetch_lotto_data(active_count)
 ai_engine = LottoAI()
 
 if full_data and history_info:
@@ -594,7 +960,6 @@ if full_data and history_info:
     latest_epsd     = history_info[0][0]
     target_epsd     = latest_epsd + 1
     history_records = load_history()
-    epsd_result_map = {e: (set(n), b) for e, n, b in history_info}
 
     st.title("인공지능 로또 분석기")
     tab_home, tab_stats, tab_history, tab_help = st.tabs([
@@ -606,72 +971,88 @@ if full_data and history_info:
     # ==========================================
     with tab_home:
 
-        # 모바일 전용 설정 패널
-        st.markdown('<div class="mobile-only-settings">', unsafe_allow_html=True)
-        with st.expander("⚙️ 분석 설정 (모바일 전용)", expanded=False):
+        with st.expander("⚙️ 분석 설정 (모바일 / 빠른 설정)", expanded=False):
             col_a, col_b = st.columns(2)
             with col_a:
-                mb_count_val  = st.number_input("분석 회수(회)", min_value=5, max_value=100,
-                                                value=sb_count_val, step=1, key="mb_count")
-                mb_weight_val = st.number_input("흐름 가중치(%)", min_value=0,
-                                                value=sb_weight_val, step=10, key="mb_weight")
+                st.number_input(
+                    "분석 회수(회)", min_value=5, max_value=100, step=1,
+                    key="mb_count", on_change=sync_setting, args=("count", "mb")
+                )
+                st.number_input(
+                    "흐름 가중치(%)", min_value=0, step=10,
+                    key="mb_weight", on_change=sync_setting, args=("weight", "mb")
+                )
+                st.button(
+                    "🔄 데이터 새로고침",
+                    key="mb_refresh_btn",
+                    use_container_width=True,
+                    on_click=refresh_all_data,
+                )
             with col_b:
-                mb_use_trend   = st.checkbox("🔥 흐름 가중치",     value=sb_use_trend,   key="mb_trend")
-                mb_use_cold    = st.checkbox("❄️ 미출수 부활",     value=sb_use_cold,    key="mb_cold")
-                mb_use_omr     = st.checkbox("📝 OMR 편중 차단",   value=sb_use_omr,     key="mb_omr")
-                mb_use_end     = st.checkbox("⚡ 끝자리 일치",     value=sb_use_end,     key="mb_end")
-                mb_use_dead    = st.checkbox("☠️ 제외 구간",       value=sb_use_dead,    key="mb_dead")
-                mb_use_stats   = st.checkbox("📊 통계 거르기",     value=sb_use_stats,   key="mb_stats")
-                mb_use_consec  = st.checkbox("🔗 이어지는 번호",   value=sb_use_consec,  key="mb_consec")
-                mb_use_prime   = st.checkbox("🔢 소수 필터",       value=sb_use_prime,   key="mb_prime")
-                mb_use_ac      = st.checkbox("📐 AC값 필터",       value=sb_use_ac,      key="mb_ac")
-                mb_use_section = st.checkbox("⚖️ 구간 합 균형",    value=sb_use_section, key="mb_section")
-                mb_use_multi   = st.checkbox("✖️ 배수 편중 차단",  value=sb_use_multi,   key="mb_multi")
-                mb_use_pop     = st.checkbox("💰 당첨금 분산 방지", value=sb_use_pop,     key="mb_pop")
+                st.checkbox("🔥 흐름 가중치",      key="mb_trend",   on_change=sync_setting, args=("trend", "mb"))
+                st.checkbox("❄️ 미출수 부활",      key="mb_cold",    on_change=sync_setting, args=("cold", "mb"))
+                st.checkbox("📝 OMR 편중 차단",    key="mb_omr",     on_change=sync_setting, args=("omr", "mb"))
+                st.checkbox("⚡ 끝자리 일치",      key="mb_end",     on_change=sync_setting, args=("end", "mb"))
+                st.checkbox("☠️ 제외 구간",        key="mb_dead",    on_change=sync_setting, args=("dead", "mb"))
+                st.checkbox("📊 통계 거르기",      key="mb_stats",   on_change=sync_setting, args=("stats", "mb"))
+                st.checkbox("🔗 이어지는 번호",    key="mb_consec",  on_change=sync_setting, args=("consec", "mb"))
+                st.checkbox("🔢 소수 필터",        key="mb_prime",   on_change=sync_setting, args=("prime", "mb"))
+                st.checkbox("📐 AC값 필터",        key="mb_ac",      on_change=sync_setting, args=("ac", "mb"))
+                st.checkbox("⚖️ 구간 합 균형",     key="mb_section", on_change=sync_setting, args=("section", "mb"))
+                st.checkbox("✖️ 배수 편중 차단",   key="mb_multi",   on_change=sync_setting, args=("multi", "mb"))
+                st.checkbox("💰 당첨금 분산 방지", key="mb_pop",     on_change=sync_setting, args=("pop", "mb"))
 
             st.markdown("**🎯 번호 고정 / 제외**")
-            mb_fixed    = st.multiselect("고정 번호", list(range(1, 46)), key="mb_fixed")
-            mb_excluded = st.multiselect("제외 번호", list(range(1, 46)), key="mb_excluded")
+            st.multiselect(
+                "고정 번호", list(range(1, 46)),
+                key="mb_fixed", on_change=sync_setting, args=("fixed", "mb")
+            )
+            st.multiselect(
+                "제외 번호", list(range(1, 46)),
+                key="mb_excluded", on_change=sync_setting, args=("excluded", "mb")
+            )
 
-            # 모바일 핫넘버 (mb_count_val 기준으로 별도 로드)
-            st.markdown(f"**🔥 최근 핫넘버 TOP 5** (최근 {mb_count_val}회 기준)")
-            mb_full_data, mb_history = fetch_lotto_data(mb_count_val)
-            if mb_history:
-                mb_nums = [n for _, nums, _ in mb_history for n in nums]
-                mb_top5 = Counter(mb_nums).most_common(5)
+            st.markdown(f"**🔥 최근 핫넘버 TOP 5** (최근 {active_count}회 기준)")
+            if top5:
                 st.markdown("".join(
                     f"<div style='display:inline-block;margin-right:8px;'>{get_ball_html(num)}"
                     f"<span style='font-size:12px;color:#555;'> {freq}회</span></div>"
-                    for num, freq in mb_top5
+                    for num, freq in top5
                 ), unsafe_allow_html=True)
 
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # 실제 사용할 값 (모바일 expander 우선)
-        weight_val  = mb_weight_val
-        fixed_nums    = list(set(mb_fixed))
-        excluded_nums = list(set(mb_excluded))
+        # 동기화된 설정값 읽기
+        weight_val    = int(st.session_state["cfg_weight"])
+        fixed_nums    = sorted(set(st.session_state["cfg_fixed"]))
+        excluded_nums = sorted(set(st.session_state["cfg_excluded"]))
         options = {
-            "use_trend":           mb_use_trend,
-            "use_cold":            mb_use_cold,
-            "use_omr":             mb_use_omr,
-            "use_end_digit":       mb_use_end,
-            "use_dead_zone":       mb_use_dead,
-            "use_stats":           mb_use_stats,
-            "use_consecutive":     mb_use_consec,
-            "use_prime":           mb_use_prime,
-            "use_ac":              mb_use_ac,
-            "use_section_balance": mb_use_section,
-            "use_multiple":        mb_use_multi,
-            "use_popularity":      mb_use_pop,
+            "use_trend":           bool(st.session_state["cfg_trend"]),
+            "use_cold":            bool(st.session_state["cfg_cold"]),
+            "use_omr":             bool(st.session_state["cfg_omr"]),
+            "use_end_digit":       bool(st.session_state["cfg_end"]),
+            "use_dead_zone":       bool(st.session_state["cfg_dead"]),
+            "use_stats":           bool(st.session_state["cfg_stats"]),
+            "use_consecutive":     bool(st.session_state["cfg_consec"]),
+            "use_prime":           bool(st.session_state["cfg_prime"]),
+            "use_ac":              bool(st.session_state["cfg_ac"]),
+            "use_section_balance": bool(st.session_state["cfg_section"]),
+            "use_multiple":        bool(st.session_state["cfg_multi"]),
+            "use_popularity":      bool(st.session_state["cfg_pop"]),
         }
 
-        # 고정/제외 충돌 검사
+        # 고정/제외 충돌 및 유효성 검사
         conflict = set(fixed_nums) & set(excluded_nums)
+        available_pool_size = 45 - len(set(fixed_nums) | set(excluded_nums))
+        needed_count = 6 - len(fixed_nums)
+
         if conflict:
             st.error(f"고정 번호와 제외 번호가 겹칩니다: {sorted(conflict)} — 수정 후 다시 시도해주세요.")
         elif len(fixed_nums) > 5:
             st.error("고정 번호는 최대 5개까지만 설정할 수 있습니다.")
+        elif available_pool_size < needed_count:
+            st.error(
+                f"제외 번호가 너무 많아 6개를 조합할 수 없습니다. "
+                f"(현재 선택 가능 번호: {available_pool_size}개 / 필요 번호: {needed_count}개)"
+            )
         else:
             # 고정/제외 미리보기
             if fixed_nums or excluded_nums:
@@ -680,7 +1061,7 @@ if full_data and history_info:
                     if fixed_nums:
                         st.markdown("**🎯 고정 번호**")
                         st.markdown(
-                            "".join(get_ball_html(n) for n in sorted(fixed_nums)),
+                            "".join(get_ball_html(n) for n in fixed_nums),
                             unsafe_allow_html=True,
                         )
                 with pc2:
@@ -691,7 +1072,7 @@ if full_data and history_info:
                             f'width:32px;height:32px;border-radius:50%;background-color:#ccc;'
                             f'color:#666;font-weight:bold;font-size:13px;margin-right:3px;'
                             f'text-decoration:line-through;">{n}</div>'
-                            for n in sorted(excluded_nums)
+                            for n in excluded_nums
                         ), unsafe_allow_html=True)
                 st.markdown("")
 
@@ -706,13 +1087,20 @@ if full_data and history_info:
 
             if st.session_state.is_generating:
                 with st.spinner("최적의 번호를 계산 중입니다..."):
-                    games = generate_ai_games(full_data, weight_val, options, fixed_nums, excluded_nums)
-                with st.spinner("구글 시트에 저장 중... (최대 3회 재시도)"):
-                    saved_to_sheet = save_history(target_epsd, games)
-
-                st.session_state.recent_generated_games = games
-                st.session_state.last_save_to_sheet     = saved_to_sheet
-                st.session_state.is_generating          = False
+                    games = generate_ai_games(
+                        full_data,
+                        weight_val,
+                        options,
+                        fixed_nums,
+                        excluded_nums,
+                        scope=active_count,
+                    )
+                if games:
+                    with st.spinner("구글 시트에 저장 중... (최대 3회 재시도)"):
+                        saved_to_sheet = save_history(target_epsd, games)
+                    st.session_state.recent_generated_games = games
+                    st.session_state.last_save_to_sheet     = saved_to_sheet
+                st.session_state.is_generating = False
                 st.rerun()
 
             if st.session_state.recent_generated_games and not st.session_state.is_generating:
@@ -725,9 +1113,9 @@ if full_data and history_info:
                     st.warning("번호 생성 완료. 구글 시트 저장에 실패하여 로컬 파일에 저장했습니다. 📁")
                 st.markdown("<br>", unsafe_allow_html=True)
 
-        with st.expander(f"📋 최근 {sb_count_val}회 당첨 결과 확인하기", expanded=True):
-            for epsd, nums, _ in reversed(history_info):
-                draw_row(f"{epsd}회", nums, is_header=True)
+        with st.expander(f"📋 최근 {active_count}회 당첨 결과 확인하기", expanded=True):
+            for epsd, nums, bonus in history_info:
+                draw_row(f"{epsd}회", nums, is_header=True, bonus=bonus)
 
     # ==========================================
     # 탭 2: 수익률/통계 + 전체 이력 분석 + 빈도 차트
@@ -764,6 +1152,7 @@ if full_data and history_info:
                     elif match == 3:               prize_counts[5] += 1
                     else:                          prize_counts["fail"] += 1
 
+            # 전체 회차 당첨 결과 맵(epsd_result_map)과 대조하여 과거 전체 누적 이력 집계
             if rec_epsd in epsd_result_map:
                 w_nums, w_bonus = epsd_result_map[rec_epsd]
                 for game in rec_games:
@@ -783,7 +1172,7 @@ if full_data and history_info:
             border-radius:10px;text-align:center;color:white;margin-bottom:20px;">
   <div style="font-size:15px;opacity:0.9;margin-bottom:5px;">현재 준비 중인 {target_epsd}회차 대비</div>
   <div style="font-size:24px;font-weight:bold;">
-    이번 주 총 <span style="font-size:32px;color:#f1c40f;">{this_week_usage_count}</span> 게임의 분석이 진행되었습니다.
+    이번 주 총 <span style="font-size:32px;color:#f1c40f;">{this_week_usage_count:,}</span> 게임의 분석이 진행되었습니다.
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -793,7 +1182,7 @@ if full_data and history_info:
         if total_games_last_week == 0:
             st.info(f"아직 데이터베이스에 {latest_epsd}회차 생성 기록이 없습니다.")
         else:
-            prizes      = fetch_prize_info(latest_epsd)
+            prizes      = fetch_prize_info(latest_epsd, epsd_prize_map)
             total_spent = total_games_last_week * 1_000
             first_prize = prizes[1] if prizes[1] is not None else 0
             total_won   = (
@@ -804,7 +1193,9 @@ if full_data and history_info:
                 prize_counts[5] * prizes[5]
             )
             roi = (total_won / total_spent * 100) if total_spent > 0 else 0
-            first_prize_label = f"약 {first_prize // 100_000_000}억" if first_prize else "확인불가"
+            first_prize_label = f"약 {first_prize / 100_000_000:.1f}억" if first_prize else "확인불가"
+            second_prize_label = f"약 {prizes[2] // 10_000:,}만" if prizes.get(2) else "약 5천만"
+            third_prize_label  = f"약 {prizes[3] // 10_000:,}만" if prizes.get(3) else "약 150만"
 
             st.markdown(f"""
 <div style="display:flex;flex-direction:row;justify-content:space-around;
@@ -826,9 +1217,9 @@ if full_data and history_info:
 
             st.markdown(f"**총 {total_games_last_week:,}게임 중 당첨 내역**")
             c1, c2, c3 = st.columns(3)
-            with c1: st.markdown(stat_box(f"{prize_counts[1]:,} 회", f"1등 ({first_prize_label})", "#C0392B"), unsafe_allow_html=True)
-            with c2: st.markdown(stat_box(f"{prize_counts[2]:,} 회", "2등 (약 5천만)",            "#8E44AD"), unsafe_allow_html=True)
-            with c3: st.markdown(stat_box(f"{prize_counts[3]:,} 회", "3등 (약 150만)",             "#2980B9"), unsafe_allow_html=True)
+            with c1: st.markdown(stat_box(f"{prize_counts[1]:,} 회", f"1등 ({first_prize_label})",  "#C0392B"), unsafe_allow_html=True)
+            with c2: st.markdown(stat_box(f"{prize_counts[2]:,} 회", f"2등 ({second_prize_label})", "#8E44AD"), unsafe_allow_html=True)
+            with c3: st.markdown(stat_box(f"{prize_counts[3]:,} 회", f"3등 ({third_prize_label})",  "#2980B9"), unsafe_allow_html=True)
             c4, c5, c6 = st.columns(3)
             with c4: st.markdown(stat_box(f"{prize_counts[4]:,} 회", "4등 (5만 원)",  "#F39C12"), unsafe_allow_html=True)
             with c5: st.markdown(stat_box(f"{prize_counts[5]:,} 회", "5등 (5천 원)",  "#27AE60"), unsafe_allow_html=True)
@@ -844,12 +1235,12 @@ if full_data and history_info:
         st.markdown("---")
         st.subheader("🔬 전체 이력 기반 필터 효과 분석")
         if all_time_total == 0:
-            st.info("분석할 이력 데이터가 없습니다. 번호를 생성하면 누적 통계가 쌓입니다.")
+            st.info("추첨 완료된 회차에 대한 분석 이력 데이터가 아직 없습니다. 번호를 생성하면 누적 통계가 쌓입니다.")
         else:
             hit_rate = (all_time_total - all_time_prize_counts["fail"]) / all_time_total * 100
             st.markdown(f"""
 <div style="background:#f8f9fa;border-radius:10px;padding:15px;margin-bottom:15px;border:1px solid #dee2e6;">
-  <div style="font-size:14px;color:#555;margin-bottom:4px;">누적 분석 게임 수</div>
+  <div style="font-size:14px;color:#555;margin-bottom:4px;">누적 분석 게임 수 (추첨 완료 회차 기준)</div>
   <div style="font-size:28px;font-weight:bold;color:#2c3e50;">{all_time_total:,} 게임</div>
   <div style="font-size:14px;color:#27AE60;margin-top:4px;">전체 적중률 (5등 이상): <b>{hit_rate:.2f}%</b></div>
 </div>
@@ -865,7 +1256,7 @@ if full_data and history_info:
 
         # 번호별 출현 빈도 바 차트
         st.markdown("---")
-        st.subheader(f"📊 최근 {sb_count_val}회 번호별 출현 빈도")
+        st.subheader(f"📊 최근 {active_count}회 번호별 출현 빈도")
         freq_dict = Counter(recent_nums)
         df_chart = pd.DataFrame({
             "출현 횟수": [freq_dict.get(i, 0) for i in range(1, 46)]
@@ -907,12 +1298,12 @@ if full_data and history_info:
                 elif epsd == latest_epsd: suffix = " ← 지난 주"
 
                 with st.expander(
-                    f"🗓️ {epsd}회차 — {len(games_list)}게임{suffix}",
+                    f"🗓️ {epsd}회차 — {len(games_list):,}게임{suffix}",
                     expanded=(epsd == target_epsd or has_upper_win),
                 ):
                     if won_set:
                         st.markdown("**해당 회차 당첨 번호**")
-                        draw_row("당첨", sorted(list(won_set)), is_header=True)
+                        draw_row("당첨", sorted(list(won_set)), is_header=True, bonus=won_bonus)
                         st.markdown("---")
 
                     for i, game in enumerate(games_list):
@@ -948,10 +1339,10 @@ if full_data and history_info:
              "인원을 줄이는 목적입니다. 6개 전부 1~31(생일수) 조합이나 완전 등차수열처럼 사람들이 몰려서 "
              "고르는 패턴을 피합니다."),
             ("🔥 흐름 가중치 (Trend Weight)",          "info",
-             "최근 15주 자주 나온 번호에 약간의 가중치를 둡니다. 참고: 로또는 독립 시행이라 과거 출현 빈도가 "
+             "최근 분석 회차에서 자주 나온 번호에 약간의 가중치를 둡니다. 참고: 로또는 독립 시행이라 과거 출현 빈도가 "
              "다음 회차 확률에 영향을 준다는 근거는 없습니다. 재미 요소로 생각해 주세요."),
             ("❄️ 미출수 부활 (Cold Number)",            "info",
-             "최근 15주간 나오지 않은 번호를 1개 이상 포함시킵니다. '회귀의 법칙'은 통계적으로 검증된 개념이 "
+             "최근 분석 회차 동안 나오지 않은 번호를 1개 이상 포함시킵니다. '회귀의 법칙'은 통계적으로 검증된 개념이 "
              "아니며, 이 역시 확률을 바꾸지는 않습니다."),
             ("📝 OMR 편중 차단 (OMR Pattern)",          "warning",
              "실제 로또 OMR 용지(5열 9행) 기준, 같은 가로줄이나 세로줄에 번호가 4개 이상 몰리는 조합을 "
@@ -995,5 +1386,7 @@ if full_data and history_info:
 
 else:
     st.error("서버에서 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.")
-# history_info 변수에 담긴 진짜 에러 메시지를 출력합니다.
     st.warning(f"디버그 에러 로그: {history_info}")
+    if st.button("🔄 다시 시도"):
+        refresh_all_data()
+        st.rerun()
